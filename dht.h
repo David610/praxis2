@@ -39,3 +39,4 @@ void dht_handle_message(struct dht_node *node, const struct dht_message *msg,
                        const struct sockaddr_in *sender, int udp_sock);
 bool dht_join(struct dht_node *node, int sock, const struct sockaddr_in *bootstrap);
 void dht_stabilize(struct dht_node *node, int sock);
+bool is_responsible(uint16_t hash, uint16_t pred_id, uint16_t node_id);

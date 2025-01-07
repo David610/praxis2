@@ -65,6 +65,16 @@ bool dht_join(struct dht_node *node, int sock, const struct sockaddr_in *bootstr
     return false;
 }
 
+bool is_responsible(uint16_t hash, uint16_t pred_id, uint16_t node_id) {
+    if (pred_id < node_id) {
+        // Normal case: responsible for range (pred_id, node_id]
+        return hash > pred_id && hash <= node_id;
+    } else {
+        // Wraparound case: responsible for range (pred_id, MAX_UINT16] U [0, node_id]
+        return hash > pred_id || hash <= node_id;
+    }
+}
+
 void dht_stabilize(struct dht_node *node, int sock) {
     if (node->initialized) {
         // Send stabilize message to successor
