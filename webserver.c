@@ -15,6 +15,7 @@
 #include "data.h"
 #include "http.h"
 #include "util.h"
+#include "dht.h"
 
 #define MAX_RESOURCES 100
 
@@ -30,6 +31,74 @@ struct tuple resources[MAX_RESOURCES] = {
  * @param request   A pointer to the struct containing the parsed request
  * information.
  */
+
+struct server_state {
+    // HTTP state
+    struct connection_state http_conn;
+    int tcp_socket;  // Listening socket for HTTP
+    
+    // DHT state
+    struct dht_node node;
+    int udp_socket;  // Socket for DHT messages
+};
+
+int setup_tcp_socket(struct sockaddr_in addr) {
+    const int enable = 1;
+    const int backlog = 1;
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        perror("TCP socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
+        perror("setsockopt failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("TCP bind failed");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(sock, backlog)) {
+        perror("listen failed");
+        exit(EXIT_FAILURE);
+    }
+
+    return sock;
+}
+
+int setup_udp_socket(struct sockaddr_in addr) {
+    const int enable = 1;
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == -1) {
+        perror("UDP socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
+        perror("setsockopt for UDP failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("UDP bind failed");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
+    return sock;
+}
+
 void send_reply(int conn, struct request *request) {
 
     // Create a buffer to hold the HTTP reply
@@ -245,6 +314,27 @@ static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
  *
  * @return The file descriptor of the created TCP server socket.
  */
+
+void handle_dht_message(struct server_state *state) {
+    struct dht_message msg;
+    struct sockaddr_in sender;
+    socklen_t sender_len = sizeof(sender);
+    
+    // Receive DHT message
+    ssize_t recv_len = recvfrom(state->udp_socket, &msg, sizeof(msg), 0,
+                               (struct sockaddr *)&sender, &sender_len);
+                               
+    if (recv_len == sizeof(struct dht_message)) {
+        // Convert from network byte order if needed
+        msg.hash_id = ntohs(msg.hash_id);
+        msg.node_id = ntohs(msg.node_id);
+        msg.port = ntohs(msg.port);
+        
+        // Handle the message
+        dht_handle_message(&state->node, &msg, &sender, state->udp_socket);
+    }
+}
+
 static int setup_server_socket(struct sockaddr_in addr) {
     const int enable = 1;
     const int backlog = 1;
@@ -295,7 +385,7 @@ static int setup_server_socket(struct sockaddr_in addr) {
  *  ./build/webserver self.ip self.port
  */
 int main(int argc, char **argv) {
-    if (argc != 3) {
+    if (argc != 3 && argc != 5) {
         return EXIT_FAILURE;
     }
 
@@ -304,55 +394,72 @@ int main(int argc, char **argv) {
     // Set up a server socket.
     int server_socket = setup_server_socket(addr);
 
-    // Create an array of pollfd structures to monitor sockets.
-    struct pollfd sockets[2] = {
+    // Create UDP socket for DHT on same port
+    int dht_socket = setup_udp_socket(addr);
+
+    // Initialize server state
+    struct server_state server = {0};
+    server.tcp_socket = server_socket;
+    server.udp_socket = dht_socket;
+    
+    // Initialize DHT node state
+    dht_init(&server.node, &addr);
+
+    // Join DHT network if bootstrap node is provided
+    if (argc == 5) {
+        struct sockaddr_in bootstrap = derive_sockaddr(argv[3], argv[4]);
+        if (!dht_join(&server.node, dht_socket, &bootstrap)) {
+            fprintf(stderr, "Failed to join DHT network\n");
+            close(server_socket);
+            close(dht_socket);
+            return EXIT_FAILURE;
+        }
+    }
+
+    struct pollfd sockets[3] = {
         {.fd = server_socket, .events = POLLIN},
+        {.fd = -1, .events = 0},
+        {.fd = dht_socket, .events = POLLIN}
     };
 
-    struct connection_state state = {0};
     while (true) {
-
-        // Use poll() to wait for events on the monitored sockets.
-        int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
+        int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), 5000);
         if (ready == -1) {
             perror("poll");
             exit(EXIT_FAILURE);
         }
 
+        // Handle DHT maintenance on timeout
+        if (ready == 0) {
+            dht_stabilize(&server.node, server.udp_socket);
+            continue;
+        }
+
         // Process events on the monitored sockets.
         for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) {
             if (sockets[i].revents != POLLIN) {
-                // If there are no POLLIN events on the socket, continue to the
-                // next iteration.
                 continue;
             }
             int s = sockets[i].fd;
 
             if (s == server_socket) {
-
-                // If the event is on the server_socket, accept a new connection
-                // from a client.
                 int connection = accept(server_socket, NULL, NULL);
-                if (connection == -1 && errno != EAGAIN &&
-                    errno != EWOULDBLOCK) {
+                if (connection == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     close(server_socket);
                     perror("accept");
                     exit(EXIT_FAILURE);
-                } else {
-                    connection_setup(&state, connection);
-
-                    // limit to one connection at a time
+                } else if (connection != -1) {
+                    connection_setup(&server.http_conn, connection);
                     sockets[0].events = 0;
                     sockets[1].fd = connection;
                     sockets[1].events = POLLIN;
                 }
+            } else if (s == dht_socket) {
+                handle_dht_message(&server);
             } else {
-                assert(s == state.sock);
-
-                // Call the 'handle_connection' function to process the incoming
-                // data on the socket.
-                bool cont = handle_connection(&state);
-                if (!cont) { // get ready for a new connection
+                assert(s == server.http_conn.sock);
+                bool cont = handle_connection(&server.http_conn);
+                if (!cont) {
                     sockets[0].events = POLLIN;
                     sockets[1].fd = -1;
                     sockets[1].events = 0;
@@ -361,5 +468,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    close(server.tcp_socket);
+    close(server.udp_socket);
     return EXIT_SUCCESS;
 }
