@@ -1,0 +1,109 @@
+# Compiled object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+*.so
+*.dylib
+*.dll
+
+# Executable files
+*.exe
+*.out
+*.app
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.mod
+*.cmd
+
+# Dependency files
+*.d
+*.dep
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.bkp
+*.orig
+*.save
+*.sublime-workspace
+
+# Core dumps
+core
+*.core
+
+# IDE files (add or remove based on your IDE)
+# CLion
+.idea/
+cmake-build-debug/
+cmake-build-release/
+
+# Code::Blocks
+*.layout
+
+# Eclipse
+.project
+.cproject
+.settings/
+
+# Visual Studio
+*.ncb
+*.sdf
+*.opensdf
+*.vcxproj.user
+*.VC.db
+
+# Xcode
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+DerivedData/
+*.xcworkspace
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+build/
+
+# Other
+*.ipch
+*.objdump
+*.lst
+*.map
+tags
