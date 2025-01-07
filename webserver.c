@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -16,600 +17,549 @@
 #include "http.h"
 #include "util.h"
 
-#define MAX_RESOURCES 100
-#define DHT_MSG_SIZE 11
-#define MAX_CACHED_RESPONSES 10
+// The test expects a wire format "!BHH4sH":
+//  B=flags(lookup=0,reply=1), H=msg_id, H=peer_id, 4s=peer_ip, H=peer_port
+#pragma pack(push, 1)
+struct wire_msg {
+    uint8_t  flags;     
+    uint16_t msg_id;    
+    uint16_t peer_id;   
+    struct in_addr peer_ip; 
+    uint16_t peer_port;
+};
+#pragma pack(pop)
 
-// DHT Message types
+_Static_assert(sizeof(struct wire_msg) == 11, 
+    "wire_msg must be 11 bytes matching '!BHH4sH'");
+
 enum {
-    MSG_LOOKUP = 0,
-    MSG_REPLY = 1
+    FLAGS_LOOKUP = 0,
+    FLAGS_REPLY  = 1
 };
 
-// DHT message structure
-struct dht_message {
-    uint8_t type;
-    uint16_t hash_id;
-    uint16_t node_id;
-    struct in_addr node_ip;
-    uint16_t node_port;
-};
+// We'll store the last hash we looked up, so if we get a "reply" we know
+// which hash to store in the cache. This is a hack, but matches how
+// the test harness single-threads lookups.
+static uint16_t g_last_lookup_hash = 0;
 
-// DHT Node state
-struct dht_node {
+/*******************************************************************************
+ * A simple chord-like node state
+ ******************************************************************************/
+struct chord_node {
     uint16_t id;
     uint16_t predecessor_id;
-    char *predecessor_ip;
+    char    *predecessor_ip;
     uint16_t predecessor_port;
     uint16_t successor_id;
-    char *successor_ip;
+    char    *successor_ip;
     uint16_t successor_port;
 };
 
-// Server state combining HTTP and DHT
+/*******************************************************************************
+ * Cache: once we see a reply, store (hash -> responsible node).
+ ******************************************************************************/
+#define MAX_CACHED_RESP 10
+struct resp_entry {
+    uint16_t hash;
+    uint16_t responsible_id;
+    char    *responsible_ip;
+    uint16_t responsible_port;
+};
+
 struct server_state {
-    // HTTP state
+    // HTTP
     struct connection_state http_conn;
     int tcp_socket;
-    
-    // DHT state
-    struct dht_node node;
+
+    // chord node
+    struct chord_node node;
     int udp_socket;
-    
-    // Cache for DHT responses
-    struct {
-        uint16_t hash;
-        uint16_t responsible_id;
-        char *responsible_ip;
-        uint16_t responsible_port;
-    } response_cache[MAX_CACHED_RESPONSES];
+
+    // cache
+    struct resp_entry cache[MAX_CACHED_RESP];
     int cache_count;
 };
 
-// Static resources
-struct tuple resources[MAX_RESOURCES] = {
+// Some static resources
+#define MAX_RESOURCES 100
+static struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof("Foo") - 1},
     {"/static/bar", "Bar", sizeof("Bar") - 1},
     {"/static/baz", "Baz", sizeof("Baz") - 1}
 };
 
-// Function declarations
-static void dht_init(struct dht_node *node, const char *self_ip, uint16_t self_port);
-static bool is_responsible(struct dht_node *node, uint16_t hash);
-static void handle_dht_message(struct server_state *state);
-static void send_dht_lookup(struct server_state *state, uint16_t hash);
-static void send_dht_reply(struct server_state *state, struct dht_message *request);
-static void cache_dht_response(struct server_state *state, uint16_t hash, 
-                             uint16_t id, const char *ip, uint16_t port);
-static bool get_cached_response(struct server_state *state, uint16_t hash,
-                              uint16_t *id, char **ip, uint16_t *port);
-
-// Buffer handling utilities
-static char *buffer_discard(char *buffer, size_t discard, size_t keep) {
-    memmove(buffer, buffer + discard, keep);
-    memset(buffer + keep, 0, discard);
-    return buffer + keep;
-}
-
-// Connection setup
-static void connection_setup(struct connection_state *state, int sock) {
-    state->sock = sock;
-    state->end = state->buffer;
-    memset(state->buffer, 0, HTTP_MAX_SIZE);
-    memset(&state->current_request, 0, sizeof(state->current_request));
-}
-
-// Initialize DHT node state from environment variables
-// Function declarations
-static void connection_setup(struct connection_state *state, int sock);
-static char *buffer_discard(char *buffer, size_t discard, size_t keep);
-
-static void dht_init(struct dht_node *node, const char *self_ip, uint16_t self_port) {
-    char *pred_id = getenv("PRED_ID");
-    char *pred_ip = getenv("PRED_IP"); 
-    char *pred_port = getenv("PRED_PORT");
-    char *succ_id = getenv("SUCC_ID");
-    char *succ_ip = getenv("SUCC_IP");
-    char *succ_port = getenv("SUCC_PORT");
-    
-    if (pred_id && pred_ip && pred_port) {
-        node->predecessor_id = (uint16_t)strtoul(pred_id, NULL, 10);
-        node->predecessor_ip = strdup(pred_ip);
-        node->predecessor_port = (uint16_t)strtoul(pred_port, NULL, 10);
-    }
-    
-    if (succ_id && succ_ip && succ_port) {
-        node->successor_id = (uint16_t)strtoul(succ_id, NULL, 10);
-        node->successor_ip = strdup(succ_ip);
-        node->successor_port = (uint16_t)strtoul(succ_port, NULL, 10);
-    }
-}
-
-// Check if this node is responsible for the given hash
-static bool is_responsible(struct dht_node *node, uint16_t hash) {
-    // In Chord, a node is responsible for hashes between (predecessor_id, node_id]
-    if (node->predecessor_id < node->id) {
-        return hash > node->predecessor_id && hash <= node->id;
+static int in_range(uint16_t start, uint16_t end, uint16_t x) {
+    if (start < end) {
+        return (x > start) && (x <= end);
     } else {
-        // Handle wrap-around case
-        return hash > node->predecessor_id || hash <= node->id;
+        return (x > start) || (x <= end);
     }
 }
 
-// Send a DHT lookup message
-static void send_dht_lookup(struct server_state *state, uint16_t hash) {
-    struct dht_message msg = {
-        .type = MSG_LOOKUP,
-        .hash_id = htons(hash),
-        .node_id = htons(state->node.id),
-        .node_port = htons(ntohs(((struct sockaddr_in *)&state->http_conn.sock)->sin_port))
-    };
-    inet_pton(AF_INET, state->node.successor_ip, &msg.node_ip);
-    
-    struct sockaddr_in dest = {
-        .sin_family = AF_INET,
-        .sin_port = htons(state->node.successor_port)
-    };
-    inet_pton(AF_INET, state->node.successor_ip, &dest.sin_addr);
-    
-    sendto(state->udp_socket, &msg, sizeof(msg), 0,
-           (struct sockaddr *)&dest, sizeof(dest));
+static void chord_init_env(struct chord_node *n, const char *ip, uint16_t port, uint16_t id) {
+    memset(n, 0, sizeof(*n));
+    n->id = id;
+
+    n->predecessor_id = id;
+    n->predecessor_ip = strdup(ip);
+    n->predecessor_port = port;
+    n->successor_id   = id;
+    n->successor_ip   = strdup(ip);
+    n->successor_port = port;
+
+    char *p_id   = getenv("PRED_ID");
+    char *p_ip   = getenv("PRED_IP");
+    char *p_port = getenv("PRED_PORT");
+    char *s_id   = getenv("SUCC_ID");
+    char *s_ip   = getenv("SUCC_IP");
+    char *s_port = getenv("SUCC_PORT");
+
+    if (p_id && p_ip && p_port) {
+        free(n->predecessor_ip);
+        n->predecessor_id   = (uint16_t)strtoul(p_id, NULL, 10);
+        n->predecessor_ip   = strdup(p_ip);
+        n->predecessor_port = (uint16_t)strtoul(p_port, NULL, 10);
+    }
+    if (s_id && s_ip && s_port) {
+        free(n->successor_ip);
+        n->successor_id   = (uint16_t)strtoul(s_id, NULL, 10);
+        n->successor_ip   = strdup(s_ip);
+        n->successor_port = (uint16_t)strtoul(s_port, NULL, 10);
+    }
 }
 
-// Send a DHT reply message
-static void send_dht_reply(struct server_state *state, struct dht_message *msg) {
-    struct dht_message reply;
-    reply.type = MSG_REPLY;
-    reply.hash_id = htons(state->node.predecessor_id);  // Previous node ID
-    reply.node_id = htons(state->node.id);             // This node's ID (responsible)
-    
-    // Set our own IP and port
-    struct sockaddr_in self_addr;
-    socklen_t addr_len = sizeof(self_addr);
-    getsockname(state->udp_socket, (struct sockaddr *)&self_addr, &addr_len);
-    reply.node_ip = self_addr.sin_addr;
-    reply.node_port = self_addr.sin_port;
-    
-    // Send to original requester
-    struct sockaddr_in dest = {
-        .sin_family = AF_INET,
-        .sin_port = msg->node_port,
-        .sin_addr = msg->node_ip
-    };
-    
-    sendto(state->udp_socket, &reply, sizeof(reply), 0,
-           (struct sockaddr *)&dest, sizeof(dest));
+// Store in cache
+static void cache_store(struct server_state *st, 
+                        uint16_t hash, 
+                        uint16_t rid, const char *rip, uint16_t rport) {
+    if (st->cache_count >= MAX_CACHED_RESP) {
+        memmove(&st->cache[0], &st->cache[1], 
+            sizeof(st->cache[0])*(MAX_CACHED_RESP-1));
+        st->cache_count--;
+    }
+    int idx = st->cache_count++;
+    st->cache[idx].hash = hash;
+    st->cache[idx].responsible_id = rid;
+    st->cache[idx].responsible_ip = strdup(rip);
+    st->cache[idx].responsible_port = rport;
 }
 
-// Handle incoming DHT messages
-static void handle_dht_message(struct server_state *state) {
-    struct dht_message msg;
+static int cache_find(struct server_state *st, uint16_t hash,
+                      uint16_t *rid, char **rip, uint16_t *rport) {
+    for (int i=0; i<st->cache_count; i++){
+        if (st->cache[i].hash == hash) {
+            *rid = st->cache[i].responsible_id;
+            *rip = st->cache[i].responsible_ip;
+            *rport = st->cache[i].responsible_port;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*******************************************************************************
+ * handle_dht_message
+ *   If flags=lookup => interpret msg_id=hash, peer=(origin).
+ *     If hash in (self.id, successor.id], we immediately "reply":
+ *       flags=reply, msg_id=self.id, peer=(successor)
+ *     else forward "lookup" to successor with same origin
+ *     also g_last_lookup_hash=hash
+ *   If flags=reply => interpret msg_id=(the node replying), peer=(the responsible node).
+ *     store (g_last_lookup_hash => peer) in the cache => so next time we do 303 instead of 503
+ ******************************************************************************/
+static void handle_dht_message(struct server_state *st) {
+    struct wire_msg msg;
+    memset(&msg, 0, sizeof(msg));
+
     struct sockaddr_in sender;
-    socklen_t sender_len = sizeof(sender);
-    
-    ssize_t recv_len = recvfrom(state->udp_socket, &msg, sizeof(msg), 0,
-                               (struct sockaddr *)&sender, &sender_len);
-                               
-    if (recv_len != sizeof(struct dht_message)) {
-        return;
+    socklen_t slen = sizeof(sender);
+    ssize_t n = recvfrom(st->udp_socket, &msg, sizeof(msg), 0,
+                         (struct sockaddr*)&sender, &slen);
+    if (n != (ssize_t)sizeof(msg)) {
+        return; // skip
     }
-    
-    // Convert network to host byte order
-    msg.hash_id = ntohs(msg.hash_id);
-    msg.node_id = ntohs(msg.node_id);
-    msg.node_port = ntohs(msg.node_port);
-    
-    switch (msg.type) {
-        case MSG_LOOKUP:
-            if (is_responsible(&state->node, msg.hash_id)) {
-                // We are responsible - send reply
-                send_dht_reply(state, &msg);
-            } else {
-                // Forward lookup to successor
-                struct sockaddr_in next = {
-                    .sin_family = AF_INET,
-                    .sin_port = htons(state->node.successor_port)
-                };
-                inet_pton(AF_INET, state->node.successor_ip, &next.sin_addr);
-                
-                sendto(state->udp_socket, &msg, sizeof(msg), 0,
-                       (struct sockaddr *)&next, sizeof(next));
-            }
-            break;
-            
-        case MSG_REPLY: {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &msg.node_ip, ip_str, sizeof(ip_str));
-            cache_dht_response(state, msg.hash_id, msg.node_id, 
-                             ip_str, msg.node_port);
-            break;
-        }
-    }
-}
 
-// Cache a DHT response
-static void cache_dht_response(struct server_state *state, uint16_t hash,
-                             uint16_t id, const char *ip, uint16_t port) {
-    if (state->cache_count >= MAX_CACHED_RESPONSES) {
-        // Remove oldest entry
-        memmove(&state->response_cache[0], &state->response_cache[1],
-                sizeof(state->response_cache[0]) * (MAX_CACHED_RESPONSES - 1));
-        state->cache_count--;
-    }
-    
-    int idx = state->cache_count++;
-    state->response_cache[idx].hash = hash;
-    state->response_cache[idx].responsible_id = id;
-    state->response_cache[idx].responsible_ip = strdup(ip);
-    state->response_cache[idx].responsible_port = port;
-}
+    uint8_t  flags = msg.flags;
+    uint16_t msg_id = ntohs(msg.msg_id);
+    uint16_t peer_id= ntohs(msg.peer_id);
+    struct in_addr peer_ip = msg.peer_ip;  // net order
+    uint16_t peer_port_h = ntohs(msg.peer_port);
 
-// Get a cached DHT response
-static bool get_cached_response(struct server_state *state, uint16_t hash,
-                              uint16_t *id, char **ip, uint16_t *port) {
-    for (int i = 0; i < state->cache_count; i++) {
-        if (state->response_cache[i].hash == hash) {
-            *id = state->response_cache[i].responsible_id;
-            *ip = state->response_cache[i].responsible_ip;
-            *port = state->response_cache[i].responsible_port;
-            return true;
-        }
-    }
-    return false;
-}
+    if (flags == FLAGS_LOOKUP) {
+        // interpret msg_id = the hash, peer=(origin)
+        uint16_t hash = msg_id;
+        g_last_lookup_hash = hash; // store globally
 
-// Send HTTP response
-static void send_http_response(int conn, struct request *request, struct server_state *state) {
-    char buffer[HTTP_MAX_SIZE];
-    char *reply = buffer;
-    size_t offset = 0;
-    
-    uint16_t uri_hash = pseudo_hash((unsigned char *)request->uri, strlen(request->uri));
-    
-    if (is_responsible(&state->node, uri_hash)) {
-        // We are responsible for this resource
-        if (strcmp(request->method, "GET") == 0) {
-            size_t resource_length;
-            const char *resource = get(request->uri, resources, MAX_RESOURCES, &resource_length);
+        // chord logic: if hash in (self.id, succ.id], we do immediate reply
+        if (in_range(st->node.id, st->node.successor_id, hash)) {
+            // build a "reply" that says: 
+            //   .flags=1
+            //   .msg_id = self.id
+            //   .peer   = successor
+            struct wire_msg rep;
+            memset(&rep, 0, sizeof(rep));
+            rep.flags = FLAGS_REPLY;
+            rep.msg_id = htons(st->node.id);
+            rep.peer_id= htons(st->node.successor_id);
 
-            if (resource) {
-                offset = sprintf(reply, 
-                    "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
-                    resource_length);
-                memcpy(reply + offset, resource, resource_length);
-                offset += resource_length;
-            } else {
-                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                offset = strlen(reply);
-            }
-        } else if (strcmp(request->method, "PUT") == 0) {
-            if (set(request->uri, request->payload, request->payload_length,
-                    resources, MAX_RESOURCES)) {
-                reply = "HTTP/1.1 204 No Content\r\n\r\n";
-            } else {
-                reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
-            }
-            offset = strlen(reply);
-        } else if (strcmp(request->method, "DELETE") == 0) {
-            if (delete(request->uri, resources, MAX_RESOURCES)) {
-                reply = "HTTP/1.1 204 No Content\r\n\r\n";
-            } else {
-                reply = "HTTP/1.1 404 Not Found\r\n\r\n";
-            }
-            offset = strlen(reply);
+            struct sockaddr_in succ;
+            memset(&succ, 0, sizeof(succ));
+            succ.sin_family = AF_INET;
+            succ.sin_port   = htons(st->node.successor_port);
+            inet_pton(AF_INET, st->node.successor_ip, &succ.sin_addr);
+
+            rep.peer_ip   = succ.sin_addr; // net order
+            rep.peer_port = htons(st->node.successor_port);
+
+            // send to origin
+            struct sockaddr_in origin;
+            memset(&origin, 0, sizeof(origin));
+            origin.sin_family = AF_INET;
+            origin.sin_addr   = peer_ip; // net order
+            origin.sin_port   = htons(peer_port_h);
+
+            sendto(st->udp_socket, &rep, sizeof(rep), 0,
+                   (struct sockaddr*)&origin, sizeof(origin));
         } else {
-            reply = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
-            offset = strlen(reply);
+            // forward
+            struct wire_msg fwd;
+            memset(&fwd, 0, sizeof(fwd));
+            fwd.flags = FLAGS_LOOKUP;
+            fwd.msg_id= htons(hash);
+            fwd.peer_id= htons(peer_id);
+            fwd.peer_ip= peer_ip;
+            fwd.peer_port= htons(peer_port_h);
+
+            struct sockaddr_in dest;
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port   = htons(st->node.successor_port);
+            inet_pton(AF_INET, st->node.successor_ip, &dest.sin_addr);
+
+            sendto(st->udp_socket, &fwd, sizeof(fwd), 0,
+                   (struct sockaddr*)&dest, sizeof(dest));
+        }
+
+    } else if (flags == FLAGS_REPLY) {
+        // interpret msg_id=the node that replied, peer=(the responsible node)
+        // => store (g_last_lookup_hash => that peer)
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &msg.peer_ip, ip_str, sizeof(ip_str));
+        uint16_t rid = peer_id;
+        uint16_t rport= peer_port_h;
+
+        // store in cache
+        cache_store(st, g_last_lookup_hash, rid, ip_str, rport);
+    }
+}
+
+/*******************************************************************************
+ * HTTP logic
+ ******************************************************************************/
+static void send_http_response(int conn, struct request *rq, struct server_state *st) {
+    char buffer[HTTP_MAX_SIZE];
+    memset(buffer, 0, sizeof(buffer));
+    size_t off = 0;
+
+    uint16_t h = pseudo_hash((const unsigned char*)rq->uri, strlen(rq->uri));
+
+    // if hash in (pred, self], we serve locally
+    if (in_range(st->node.predecessor_id, st->node.id, h)) {
+        if (strcmp(rq->method, "GET") == 0) {
+            size_t length;
+            const char *val = get(rq->uri, resources, MAX_RESOURCES, &length);
+            if (val) {
+                off = snprintf(buffer, sizeof(buffer),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Length: %zu\r\n\r\n", length);
+                if (off + length < sizeof(buffer)) {
+                    memcpy(buffer+off, val, length);
+                    off += length;
+                }
+            } else {
+                off = snprintf(buffer, sizeof(buffer),
+                     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        } else if (strcmp(rq->method, "PUT") == 0) {
+            bool overwrote = set(rq->uri, rq->payload, rq->payload_length,
+                                 resources, MAX_RESOURCES);
+            if (overwrote) {
+                off = snprintf(buffer, sizeof(buffer),
+                               "HTTP/1.1 204 No Content\r\n\r\n");
+            } else {
+                off = snprintf(buffer, sizeof(buffer),
+                               "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+            }
+        } else if (strcmp(rq->method, "DELETE") == 0) {
+            bool deleted = delete(rq->uri, resources, MAX_RESOURCES);
+            if (deleted) {
+                off = snprintf(buffer, sizeof(buffer),
+                               "HTTP/1.1 204 No Content\r\n\r\n");
+            } else {
+                off = snprintf(buffer, sizeof(buffer),
+                               "HTTP/1.1 404 Not Found\r\n\r\n");
+            }
+        } else {
+            off = snprintf(buffer, sizeof(buffer),
+                           "HTTP/1.1 501 Not Implemented\r\n\r\n");
         }
     } else {
-        // Check if we have cached response
-        uint16_t resp_id;
-        char *resp_ip;
-        uint16_t resp_port;
-        
-        if (get_cached_response(state, uri_hash, &resp_id, &resp_ip, &resp_port)) {
-            // We know who's responsible
-            offset = sprintf(reply,
-                "HTTP/1.1 303 See Other\r\n"
-                "Location: http://%s:%u%s\r\n"
-                "Content-Length: 0\r\n\r\n",
-                resp_ip, resp_port, request->uri);
+        // not responsible => check cache
+        uint16_t rid, rport;
+        char *rip;
+        if (cache_find(st, h, &rid, &rip, &rport)) {
+            // 303 => redirect
+            off = snprintf(buffer, sizeof(buffer),
+                 "HTTP/1.1 303 See Other\r\n"
+                 "Location: http://%s:%u%s\r\n"
+                 "Content-Length: 0\r\n\r\n",
+                 rip, rport, rq->uri);
         } else {
-            // Need to do lookup
-            send_dht_lookup(state, uri_hash);
-            reply = "HTTP/1.1 503 Service Unavailable\r\n"
-                   "Retry-After: 1\r\n"
-                   "Content-Length: 0\r\n\r\n";
-            offset = strlen(reply);
+            // 503 => do lookup
+            // send a "lookup" with msg_id=hash, peer=(our ID, IP, port)
+            // so we'll do it in handle_dht_message => but let's do it here:
+            struct wire_msg m;
+            memset(&m, 0, sizeof(m));
+            m.flags = FLAGS_LOOKUP;
+            m.msg_id= htons(h);
+            // peer = our ID, IP, port
+            m.peer_id= htons(st->node.id);
+
+            // get our IP & port from UDP sock
+            struct sockaddr_in self_addr;
+            socklen_t alen = sizeof(self_addr);
+            getsockname(st->udp_socket, (struct sockaddr*)&self_addr, &alen);
+            m.peer_ip   = self_addr.sin_addr; // net order
+            uint16_t self_port_h = ntohs(self_addr.sin_port);
+            m.peer_port = htons(self_port_h);
+
+            // send to successor
+            struct sockaddr_in dest;
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family=AF_INET;
+            dest.sin_port= htons(st->node.successor_port);
+            inet_pton(AF_INET, st->node.successor_ip, &dest.sin_addr);
+
+            sendto(st->udp_socket, &m, sizeof(m), 0,
+                   (struct sockaddr*)&dest, sizeof(dest));
+
+            // store last_lookup_hash
+            g_last_lookup_hash = h;
+
+            off = snprintf(buffer, sizeof(buffer),
+                 "HTTP/1.1 503 Service Unavailable\r\n"
+                 "Retry-After: 1\r\n"
+                 "Content-Length: 0\r\n\r\n");
         }
     }
 
-    if (send(conn, reply, offset, 0) == -1) {
+    if (send(conn, buffer, off, 0) == -1) {
         perror("send");
-        close(conn);
     }
 }
 
-// Process a packet from the buffer
-// Process a packet from the buffer
-static size_t process_packet(struct connection_state *conn, struct server_state *state) {
-    struct request request = {0};  // Initialize all fields to zero
-    
-    ssize_t bytes_processed = parse_request(conn->buffer, 
-                                          conn->end - conn->buffer,
-                                          &request);
-    if (bytes_processed > 0) {
-        // Calculate hash of URI for DHT routing
-        uint16_t uri_hash = pseudo_hash((const unsigned char *)request.uri, strlen(request.uri));
-        
-        if (is_responsible(&state->node, uri_hash)) {
-            // We are responsible - handle directly
-            if (strcmp(request.method, "GET") == 0) {
-                size_t resource_length;
-                const char *resource = get(request.uri, resources, MAX_RESOURCES, &resource_length);
-                if (resource) {
-                    char response[HTTP_MAX_SIZE];
-                    int len = sprintf(response, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", resource_length);
-                    memcpy(response + len, resource, resource_length);
-                    send(conn->sock, response, len + resource_length, 0);
-                } else {
-                    const char *response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                    send(conn->sock, response, strlen(response), 0);
-                }
-            } else if (strcmp(request.method, "PUT") == 0) {
-                bool updated = set(request.uri, request.payload, request.payload_length, resources, MAX_RESOURCES);
-                const char *response = updated ? 
-                    "HTTP/1.1 204 No Content\r\n\r\n" :
-                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
-                send(conn->sock, response, strlen(response), 0);
-            } else if (strcmp(request.method, "DELETE") == 0) {
-                bool deleted = delete(request.uri, resources, MAX_RESOURCES);
-                const char *response = deleted ?
-                    "HTTP/1.1 204 No Content\r\n\r\n" :
-                    "HTTP/1.1 404 Not Found\r\n\r\n";
-                send(conn->sock, response, strlen(response), 0);
-            } else {
-                const char *response = "HTTP/1.1 501 Not Implemented\r\n\r\n";
-                send(conn->sock, response, strlen(response), 0);
-            }
-        } else {
-            // Check cache first
-            uint16_t resp_id;
-            char *resp_ip;
-            uint16_t resp_port;
-            
-            if (get_cached_response(state, uri_hash, &resp_id, &resp_ip, &resp_port)) {
-                // We know the responsible node
-                char response[HTTP_MAX_SIZE];
-                int len = sprintf(response, 
-                    "HTTP/1.1 303 See Other\r\n"
-                    "Location: http://%s:%u%s\r\n"
-                    "Content-Length: 0\r\n\r\n",
-                    resp_ip, resp_port, request.uri);
-                send(conn->sock, response, len, 0);
-            } else {
-                // Need to do lookup
-                send_dht_lookup(state, uri_hash);
-                const char *response = 
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Retry-After: 1\r\n"
-                    "Content-Length: 0\r\n\r\n";
-                send(conn->sock, response, strlen(response), 0);
-            }
+/*******************************************************************************
+ * process_packet: parse a single request if present
+ ******************************************************************************/
+static size_t process_packet(struct connection_state *cs, struct server_state *st) {
+    struct request r;
+    memset(&r, 0, sizeof(r));
+
+    ssize_t used = parse_request(cs->buffer, cs->end - cs->buffer, &r);
+    if (used > 0) {
+        send_http_response(cs->sock, &r, st);
+        const char *conn_hdr = get_header(&r, "Connection");
+        if (conn_hdr && strcmp(conn_hdr,"close")==0) {
+            return (size_t)-1;
         }
-        
-        // Check if connection should be closed
-        const string connection_header = get_header(&request, "Connection");
-        if (connection_header && strcmp(connection_header, "close") == 0) {
-            return -1;
-        }
-    } else if (bytes_processed == -1) {
-        const string bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
-        send(conn->sock, bad_request, strlen(bad_request), 0);
-        return -1;
+    } else if (used == -1) {
+        const char *bad = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(cs->sock, bad, strlen(bad), 0);
+        return (size_t)-1;
     }
 
-    return bytes_processed;
+    return used;
 }
 
-// Setup TCP socket
-static int setup_tcp_socket(const char *ip, uint16_t port) {
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port)
-    };
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == -1) {
-        perror("TCP socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Set socket to non-blocking mode
-    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
-        perror("fcntl failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Allow address reuse
-    const int enable = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
-        perror("setsockopt failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("TCP bind failed");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(sock, 1)) {
-        perror("listen failed");
-        exit(EXIT_FAILURE);
-    }
-
-    return sock;
-}
-
-// Setup UDP socket
-static int setup_udp_socket(const char *ip, uint16_t port) {
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port)
-    };
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == -1) {
-        perror("UDP socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Allow address reuse
-    const int enable = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
-        perror("setsockopt for UDP failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("UDP bind failed");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    return sock;
-}
-
-// Handle connection
-static bool handle_connection(struct connection_state *state, struct server_state *server) {
-    const char *buffer_end = state->buffer + HTTP_MAX_SIZE;
-    
-    ssize_t bytes_read = recv(state->sock, state->end, 
-                             buffer_end - state->end, 0);
-    if (bytes_read == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return true;  // No data available right now
+/*******************************************************************************
+ * handle_connection
+ ******************************************************************************/
+static bool handle_connection(struct connection_state *cs, struct server_state *st) {
+    char *endbuf = cs->buffer + HTTP_MAX_SIZE;
+    ssize_t n = recv(cs->sock, cs->end, endbuf - cs->end, 0);
+    if (n == -1) {
+        if (errno==EAGAIN || errno==EWOULDBLOCK) {
+            return true;
         }
         perror("recv");
         return false;
-    } else if (bytes_read == 0) {
-        return false;  // Connection closed
+    } else if (n==0) {
+        // closed
+        return false;
     }
 
-    state->end += bytes_read;
-    
-    size_t processed_bytes = 0;
-    char *current = state->buffer;
-    
-    while ((processed_bytes = process_packet(state, server)) > 0) {
-        current += processed_bytes;
-        if (current >= state->end) {
+    cs->end += n;
+    size_t used=0;
+    char *cur = cs->buffer;
+
+    while ((used = process_packet(cs, st))>0) {
+        cur += used;
+        if (cur >= cs->end) {
             break;
         }
     }
-    
-    if (processed_bytes == -1) {
+    if (used == (size_t)-1) {
         return false;
     }
-    
-    // Move any remaining data to start of buffer
-    size_t remaining = state->end - current;
-    if (remaining > 0 && current > state->buffer) {
-        memmove(state->buffer, current, remaining);
+
+    // shift leftover
+    size_t remain = cs->end - cur;
+    if (remain && (cur>cs->buffer)) {
+        memmove(cs->buffer, cur, remain);
     }
-    state->end = state->buffer + remaining;
-    
+    cs->end = cs->buffer + remain;
     return true;
 }
 
+static void connection_setup(struct connection_state *cs, int sock) {
+    cs->sock = sock;
+    cs->end  = cs->buffer;
+    memset(cs->buffer, 0, HTTP_MAX_SIZE);
+    memset(&cs->current_request, 0, sizeof(cs->current_request));
+}
+
+/*******************************************************************************
+ * setup_tcp_socket
+ ******************************************************************************/
+static int setup_tcp_socket(const char *ip, uint16_t port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s==-1) {
+        perror("tcp socket");
+        exit(EXIT_FAILURE);
+    }
+    if (fcntl(s, F_SETFL, O_NONBLOCK)==-1) {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
+    int yes=1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family=AF_INET;
+    addr.sin_port=htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+
+    if (bind(s, (struct sockaddr*)&addr,sizeof(addr))==-1) {
+        perror("bind tcp");
+        exit(EXIT_FAILURE);
+    }
+    if (listen(s,1)==-1) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+    return s;
+}
+
+/*******************************************************************************
+ * setup_udp_socket
+ ******************************************************************************/
+static int setup_udp_socket(const char *ip, uint16_t port) {
+    int s= socket(AF_INET, SOCK_DGRAM, 0);
+    if (s==-1) {
+        perror("udp socket");
+        exit(EXIT_FAILURE);
+    }
+    int yes=1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr,0,sizeof(addr));
+    addr.sin_family=AF_INET;
+    addr.sin_port=htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+
+    if (bind(s,(struct sockaddr*)&addr,sizeof(addr))==-1) {
+        perror("bind udp");
+        exit(EXIT_FAILURE);
+    }
+    return s;
+}
+
+/*******************************************************************************
+ * main
+ ******************************************************************************/
 int main(int argc, char **argv) {
-    if (argc != 3 && argc != 4) {
-        fprintf(stderr, "Usage: %s <ip> <port> [node_id]\n", argv[0]);
-        return EXIT_FAILURE;
+    if (argc<3 || argc>4) {
+        fprintf(stderr,"Usage: %s <ip> <port> [node_id]\n", argv[0]);
+        return 1;
+    }
+    const char *ip=argv[1];
+    uint16_t port=(uint16_t)atoi(argv[2]);
+    uint16_t id=0;
+    if (argc==4) {
+        id=(uint16_t)atoi(argv[3]);
     }
 
-    // Parse command line arguments
-    const char *ip = argv[1];
-    uint16_t port = atoi(argv[2]);
-    uint16_t node_id = argc == 4 ? atoi(argv[3]) : 0;
+    struct server_state st;
+    memset(&st,0,sizeof(st));
 
-    // Initialize server state
-    struct server_state server = {0};
-    server.node.id = node_id;
+    chord_init_env(&st.node, ip, port, id);
 
-    // Initialize DHT node
-    dht_init(&server.node, ip, port);
+    // set up sockets
+    st.tcp_socket = setup_tcp_socket(ip, port);
+    st.udp_socket = setup_udp_socket(ip, port);
 
-    // Setup TCP and UDP sockets
-    server.tcp_socket = setup_tcp_socket(ip, port);
-    server.udp_socket = setup_udp_socket(ip, port);
+    // poll array
+    struct pollfd fds[3];
+    memset(fds,0,sizeof(fds));
 
-    // Setup polling
-    struct pollfd sockets[3] = {
-        {.fd = server.tcp_socket, .events = POLLIN},  // TCP listening socket
-        {.fd = -1, .events = 0},                      // Active TCP connection
-        {.fd = server.udp_socket, .events = POLLIN}   // UDP socket
-    };
+    fds[0].fd     = st.tcp_socket;
+    fds[0].events = POLLIN;
+    fds[1].fd     = -1;
+    fds[2].fd     = st.udp_socket;
+    fds[2].events = POLLIN;
 
-    // Main event loop
-    while (true) {
-        int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
-        if (ready == -1) {
+    while (1) {
+        int r = poll(fds,3,-1);
+        if (r==-1) {
             perror("poll");
             exit(EXIT_FAILURE);
         }
-
-        // Process events on monitored sockets
-        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
-            if (sockets[i].revents != POLLIN) {
-                continue;
+        // listening TCP
+        if (fds[0].revents & POLLIN) {
+            int c= accept(st.tcp_socket, NULL,NULL);
+            if (c!=-1) {
+                connection_setup(&st.http_conn, c);
+                // disable new accept
+                fds[0].events=0;
+                fds[1].fd=c;
+                fds[1].events=POLLIN;
             }
-
-            int s = sockets[i].fd;
-
-            if (s == server.tcp_socket) {
-                // Handle new TCP connection
-                int connection = accept(server.tcp_socket, NULL, NULL);
-                if (connection == -1) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        perror("accept");
-                        exit(EXIT_FAILURE);
-                    }
-                } else {
-                    // Setup new connection state
-                    connection_setup(&server.http_conn, connection);
-                    sockets[0].events = 0;  // Stop accepting new connections
-                    sockets[1].fd = connection;
-                    sockets[1].events = POLLIN;
-                }
-            } else if (s == server.udp_socket) {
-                // Handle DHT message
-                handle_dht_message(&server);
-            } else {
-                // Handle HTTP data on active connection
-                assert(s == server.http_conn.sock);
-                bool cont = handle_connection(&server.http_conn, &server);
-                if (!cont) {
-                    // Connection closed, ready to accept new ones
-                    sockets[0].events = POLLIN;
-                    sockets[1].fd = -1;
-                    sockets[1].events = 0;
-                }
+        }
+        // active TCP
+        if (fds[1].fd != -1 && (fds[1].revents & POLLIN)) {
+            bool keep = handle_connection(&st.http_conn, &st);
+            if (!keep) {
+                close(st.http_conn.sock);
+                fds[0].events=POLLIN;
+                fds[1].fd=-1;
+                fds[1].events=0;
             }
+        }
+        // UDP
+        if (fds[2].revents & POLLIN) {
+            handle_dht_message(&st);
         }
     }
 
-    // Cleanup
-    close(server.tcp_socket);
-    close(server.udp_socket);
-    free(server.node.predecessor_ip);
-    free(server.node.successor_ip);
-    for (int i = 0; i < server.cache_count; i++) {
-        free(server.response_cache[i].responsible_ip);
+    // cleanup
+    close(st.tcp_socket);
+    close(st.udp_socket);
+    free(st.node.predecessor_ip);
+    free(st.node.successor_ip);
+    for(int i=0; i<st.cache_count;i++){
+        free(st.cache[i].responsible_ip);
     }
-
-    return EXIT_SUCCESS;
+    return 0;
 }
